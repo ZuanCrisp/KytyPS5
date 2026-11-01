@@ -1,0 +1,268 @@
+
+name: Upstream Sync and Release Mirror
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/upstream-sync.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kytyps5-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync Main, Tags and All Releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout mirror
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync upstream main and tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/KytyPS5/KytyPS5.git
+
+          git fetch origin --prune
+          git fetch upstream --prune --tags
+
+          git switch main
+          git merge --no-edit upstream/main
+
+          git push origin main
+          git push origin --tags
+
+      - name: Mirror all stable and pre-releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO="$GITHUB_REPOSITORY"
+          UPSTREAM="KytyPS5/KytyPS5"
+
+          echo "Fetching all upstream releases..."
+
+          gh api --paginate --slurp \
+            "repos/$UPSTREAM/releases?per_page=100" \
+            | jq 'add | map(select(.draft == false))' \
+            > releases.json
+
+          mapfile -t releases < <(jq -c '.[]' releases.json)
+
+          echo "Found ${#releases[@]} published releases."
+
+          for release_json in "${releases[@]}"; do
+
+            TAG=$(jq -r '.tag_name' <<< "$release_json")
+            TITLE=$(jq -r '.name // .tag_name' <<< "$release_json")
+            PRERELEASE=$(jq -r '.prerelease' <<< "$release_json")
+
+            jq -r '.body // ""' <<< "$release_json" > release-notes.md
+
+            echo "================================"
+            echo "Release: $TAG"
+            echo "Pre-release: $PRERELEASE"
+            echo "================================"
+
+            SOURCE_COUNT=$(jq '.assets | length' <<< "$release_json")
+
+            DEST_RELEASE=""
+
+            if DEST_RELEASE=$(gh api \
+              "repos/$REPO/releases/tags/$TAG" 2>/dev/null); then
+
+              DEST_ID=$(jq -r '.id' <<< "$DEST_RELEASE")
+
+              # Keep title, notes and release status synchronized.
+              jq -n \
+                --arg name "$TITLE" \
+                --rawfile body release-notes.md \
+                --argjson prerelease "$PRERELEASE" \
+                '{
+                  name: $name,
+                  body: $body,
+                  draft: false,
+                  prerelease: $prerelease
+                }' > release-update.json
+
+              gh api --method PATCH \
+                "repos/$REPO/releases/$DEST_ID" \
+                --input release-update.json
+
+              DEST_COUNT=$(jq \
+                '[.assets[]? | select(.name != "SHA256SUMS.txt")] | length' \
+                <<< "$DEST_RELEASE")
+
+              SAME_ASSETS=true
+
+              if [[ "$SOURCE_COUNT" -ne "$DEST_COUNT" ]]; then
+                SAME_ASSETS=false
+              fi
+
+              # Check existing assets before downloading again.
+              while IFS= read -r asset_json; do
+
+                NAME=$(jq -r '.name' <<< "$asset_json")
+                SOURCE_SIZE=$(jq -r '.size' <<< "$asset_json")
+                SOURCE_DIGEST=$(jq -r '.digest // ""' <<< "$asset_json")
+
+                DEST_ASSET=$(jq -c \
+                  --arg name "$NAME" \
+                  '[.assets[]? | select(.name == $name)][0] // empty' \
+                  <<< "$DEST_RELEASE")
+
+                if [[ -z "$DEST_ASSET" ]]; then
+                  SAME_ASSETS=false
+                  break
+                fi
+
+                DEST_SIZE=$(jq -r '.size' <<< "$DEST_ASSET")
+                DEST_DIGEST=$(jq -r '.digest // ""' <<< "$DEST_ASSET")
+
+                if [[ -n "$SOURCE_DIGEST" && -n "$DEST_DIGEST" ]]; then
+                  if [[ "$SOURCE_DIGEST" != "$DEST_DIGEST" ]]; then
+                    SAME_ASSETS=false
+                    break
+                  fi
+                elif [[ "$SOURCE_SIZE" != "$DEST_SIZE" ]]; then
+                  SAME_ASSETS=false
+                  break
+                fi
+
+              done < <(jq -c '.assets[]?' <<< "$release_json")
+
+              if [[ "$SOURCE_COUNT" -gt 0 ]] && \
+                ! jq -e '.assets[]? | select(.name == "SHA256SUMS.txt")' \
+                  <<< "$DEST_RELEASE" >/dev/null; then
+                SAME_ASSETS=false
+              fi
+
+              if [[ "$SAME_ASSETS" == "true" ]]; then
+                echo "Assets already synchronized: $TAG"
+                continue
+              fi
+
+              # Remove obsolete assets no longer present upstream.
+              while IFS= read -r dest_asset; do
+
+                NAME=$(jq -r '.name' <<< "$dest_asset")
+                ASSET_ID=$(jq -r '.id' <<< "$dest_asset")
+
+                if [[ "$NAME" == "SHA256SUMS.txt" && "$SOURCE_COUNT" -gt 0 ]]; then
+                  continue
+                fi
+
+                if ! jq -e --arg name "$NAME" \
+                  '[.assets[]?.name] | index($name) != null' \
+                  <<< "$release_json" >/dev/null; then
+
+                  echo "Removing obsolete asset: $NAME"
+
+                  gh api --method DELETE \
+                    "repos/$REPO/releases/assets/$ASSET_ID"
+                fi
+
+              done < <(jq -c '.assets[]?' <<< "$DEST_RELEASE")
+
+            else
+
+              # Create missing release.
+              if [[ "$PRERELEASE" == "true" ]]; then
+                gh release create "$TAG" \
+                  --repo "$REPO" \
+                  --title "$TITLE" \
+                  --notes-file release-notes.md \
+                  --prerelease \
+                  --verify-tag
+              else
+                gh release create "$TAG" \
+                  --repo "$REPO" \
+                  --title "$TITLE" \
+                  --notes-file release-notes.md \
+                  --verify-tag
+              fi
+
+            fi
+
+            rm -rf dist
+            mkdir -p dist
+
+            # Download upstream assets.
+            while IFS= read -r asset_json; do
+
+              NAME=$(jq -r '.name' <<< "$asset_json")
+              URL=$(jq -r '.browser_download_url' <<< "$asset_json")
+              EXPECTED=$(jq -r '.digest // ""' <<< "$asset_json")
+              FILENAME=$(basename -- "$NAME")
+
+              echo "Downloading: $FILENAME"
+
+              curl --fail --show-error --location \
+                --retry 3 --retry-all-errors \
+                "$URL" -o "dist/$FILENAME"
+
+              test -s "dist/$FILENAME"
+
+              EXPECTED="${EXPECTED#sha256:}"
+
+              if [[ -n "$EXPECTED" ]]; then
+                ACTUAL=$(sha256sum "dist/$FILENAME" | cut -d' ' -f1)
+
+                if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+                  echo "SHA256 mismatch: $FILENAME"
+                  exit 1
+                fi
+
+                echo "SHA256 verified: $FILENAME"
+              fi
+
+            done < <(jq -c '.assets[]?' <<< "$release_json")
+
+            # Generate local checksum manifest.
+            (
+              cd dist
+              shopt -s nullglob
+              files=(*)
+
+              if ((${#files[@]})); then
+                sha256sum -- "${files[@]}" > SHA256SUMS.txt
+              fi
+            )
+
+            # Upload all assets.
+            shopt -s nullglob
+            assets=(dist/*)
+
+            if ((${#assets[@]})); then
+              gh release upload "$TAG" "${assets[@]}" \
+                --repo "$REPO" \
+                --clobber
+            fi
+
+            echo "Successfully mirrored: $TAG"
+
+          done
+
+          echo "All releases synchronized."
