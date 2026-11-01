@@ -30,6 +30,8 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.MIRROR_TOKEN }}
+          persist-credentials: true
 
       - name: Configure Git
         run: |
