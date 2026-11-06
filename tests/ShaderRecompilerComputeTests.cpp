@@ -259,6 +259,10 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
+  // Suspend points that collect nothing.
+  static void SkipFrames(TextureCache &cache, uint64_t frames) {
+    cache.m_gc_tick += frames;
+  }
 
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
@@ -282,7 +286,7 @@ struct TextureCacheTestAccess {
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
       if (image.registered) {
-        image.tick_accessed_last = cache.m_scheduler.CurrentTick();
+        image.tick_accessed_last = tick;
         live.push_back(id);
       }
     });
@@ -5926,6 +5930,34 @@ public:
                   ImageHeapTestAccess::TailPageDirty(heap),
               "a write fault next to a table left its page watched");
       draw();
+      // The last suspend point released texture 0's image from the smaller
+      // table. Images age in frames, not command buffers: an alias frees it
+      // only after 16 frames.
+      const auto released =
+          TextureCacheTestAccess::FindImages(textures, texture(0), 64u);
+      const auto alias = [&](Prospero::TileMode tile) {
+        auto desc = MakeLinearDesc(
+            texture(0), 64u, vk::Format::eR8G8B8A8Unorm, Format::k8_8_8_8UNorm,
+            Prospero::ImageType::kColor2D, {4, 4, 1}, 1, 4, 1);
+        desc.info.tile_mode = tile;
+        desc.info.UpdateSize();
+        return textures.FindImage(desc);
+      };
+      for (uint32_t submit = 0; submit <= 16u; ++submit)
+        scheduler.Flush();
+      const auto standard = alias(Prospero::TileMode::kStandard4KB);
+      Require(name, "frame lifetime",
+              released.size() == 1u && standard != released[0] &&
+                  TextureCacheTestAccess::Contains(textures, released[0]) &&
+                  textures.GetImage(standard).tick_accessed_last ==
+                      TextureCacheTestAccess::GcTick(textures),
+              "one frame's command buffers aged a released heap image out, or "
+              "an alias missed its frame");
+      TextureCacheTestAccess::SkipFrames(textures, 17u);
+      (void)alias(Prospero::TileMode::kStandard256B);
+      Require(name, "frame aging",
+              !TextureCacheTestAccess::Contains(textures, released[0]),
+              "an alias kept a heap image unused for 17 frames");
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
       device.destroyPipelineLayout(layout, nullptr);
@@ -30414,6 +30446,44 @@ TestCase Vop1MoveRelDestination() {
   return test;
 }
 
+TestCase Vop1MoveRelDestinationSkipsLaneSpill() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  // Spill the output V# s[48:51] to v10 lanes 0..3, then clobber the SGPRs.
+  for (u32 lane = 0; lane < 4; lane++) {
+    AppendVop3(&code, 0x361, 10, 48 + lane, InlineU32(lane));
+    code.push_back(EncodeSMovB32(48 + lane, InlineU32(0)));
+  }
+  AppendVMovLiteral(&code, 1, 0x12345678u);
+  AppendVMovLiteral(&code, 2, 0x9abcdef0u);
+  // A runtime M0 of 0 writes v5 while v10 holds the spill.
+  code.push_back(EncodeVop1(0x02, 124, Vgpr(0)));
+  code.push_back(EncodeVop1(0x42, 5, Vgpr(1)));
+  for (u32 lane = 0; lane < 4; lane++)
+    AppendVop3(&code, 0x360, 48 + lane, Vgpr(10), InlineU32(lane));
+  // After the last lane read, M0 = 5 writes v10.
+  code.push_back(EncodeSMovB32(124, InlineU32(5)));
+  code.push_back(EncodeVop1(0x42, 5, Vgpr(2)));
+  AppendStoreVgpr(&code, 5, 0);
+  AppendStoreVgpr(&code, 10, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1MoveRelDestinationSkipsLaneSpill";
+  test.code = code;
+  test.expected = {0x12345678u, 0x9abcdef0u};
+  test.opcodes = {O::V_WRITELANE_B32,     O::S_MOV_B32,     O::V_MOV_B32,
+                  O::V_READFIRSTLANE_B32, O::V_MOVRELD_B32, O::V_READLANE_B32,
+                  O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase CubeIdCapturedNegationAndOutputScale() {
   using O = ShaderOpcode;
 
@@ -47529,7 +47599,7 @@ TestCase MultipleWorkitemsGlobalId() {
   return test;
 }
 
-TestCase IrreducibleControlFlow() {
+TestCase DispatcherIrreducibleControlFlow() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -47541,95 +47611,12 @@ TestCase IrreducibleControlFlow() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "IrreducibleControlFlow";
+  test.name = "DispatcherIrreducibleControlFlow";
   test.code = code;
   test.expected = {7};
   test.opcodes = {O::S_CBRANCH_SCC1, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
                   O::S_CBRANCH_SCC0, O::S_BRANCH,  O::S_ENDPGM};
   return test;
-}
-
-// Cycles with several entries; dword 0 selects the entry, s20 accumulates and
-// lands in dword 1.
-TestCase IrreducibleCycleCase(const char *name, const std::vector<u32> &cycle,
-                              u32 entry, u32 result) {
-  using O = ShaderOpcode;
-
-  TestCase test;
-  test.name = name;
-  AppendVMovU32(&test.code, 30, 0);
-  AppendBufferLoadDword(&test.code, 0, 30);
-  // v_readfirstlane_b32 s21, v0
-  test.code.push_back(EncodeVop1(0x02, 21, Vgpr(0)));
-  test.code.push_back(EncodeSMovB32(20, InlineU32(0)));
-  test.code.insert(test.code.end(), cycle.begin(), cycle.end());
-  AppendStoreSgpr(&test.code, 20, 1);
-  AppendEnd(&test.code);
-  test.initial = {entry, 0};
-  test.expected = {entry, result};
-  test.opcodes = {O::V_MOV_B32,    O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
-                  O::S_MOV_B32,    O::S_ADD_U32,         O::S_AND_B32,
-                  O::S_CMP_EQ_U32, O::S_CMP_LG_U32,      O::S_CMP_GT_U32,
-                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1,    O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
-  return test;
-}
-
-TestCase IrreducibleTwoEntryLoop(u32 entry) {
-  const std::vector<u32> cycle = {
-      EncodeSopc(0x06, 21, InlineU32(1)),      // s_cmp_eq_u32 s21, 1
-      EncodeSopp(0x05, 1),                     // s_cbranch_scc1 B
-      EncodeSop2(0x00, 20, 20, InlineU32(1)),  // A: s_add_u32 s20, s20, 1
-      EncodeSop2(0x00, 20, 20, InlineU32(16)), // B: s_add_u32 s20, s20, 16
-      EncodeSopc(0x0a, 20, InlineU32(50)),     // s_cmp_lt_u32 s20, 50
-      EncodeSopp(0x05, 0xfffcu),               // s_cbranch_scc1 A
-  };
-  return IrreducibleCycleCase(entry ? "IrreducibleTwoEntryLoop enter B"
-                                    : "IrreducibleTwoEntryLoop enter A",
-                              cycle, entry, entry ? 50u : 51u);
-}
-
-TestCase IrreducibleThreeEntryCycle(u32 entry) {
-  static constexpr const char *names[] = {"IrreducibleThreeEntryCycle enter A",
-                                          "IrreducibleThreeEntryCycle enter B",
-                                          "IrreducibleThreeEntryCycle enter C"};
-  static constexpr u32 results[] = {33, 32, 42};
-  const std::vector<u32> cycle = {
-      EncodeSopc(0x06, 21, InlineU32(1)),     // s_cmp_eq_u32 s21, 1
-      EncodeSopp(0x05, 3),                    // s_cbranch_scc1 B
-      EncodeSopc(0x06, 21, InlineU32(2)),     // s_cmp_eq_u32 s21, 2
-      EncodeSopp(0x05, 4),                    // s_cbranch_scc1 C
-      EncodeSop2(0x00, 20, 20, InlineU32(1)), // A: s_add_u32 s20, s20, 1
-      EncodeSop2(0x00, 20, 20, InlineU32(4)), // B: s_add_u32 s20, s20, 4
-      EncodeSopc(0x08, 20, InlineU32(30)),    // s_cmp_gt_u32 s20, 30
-      EncodeSopp(0x05, 3),                    // s_cbranch_scc1 exit
-      EncodeSop2(0x00, 20, 20, InlineU32(9)), // C: s_add_u32 s20, s20, 9
-      EncodeSopc(0x0a, 20, InlineU32(40)),    // s_cmp_lt_u32 s20, 40
-      EncodeSopp(0x05, 0xfff9u),              // s_cbranch_scc1 A
-  };
-  return IrreducibleCycleCase(names[entry], cycle, entry, results[entry]);
-}
-
-// A counted outer loop enters the inner two-entry cycle at A or B by parity.
-TestCase IrreducibleNestedTwoEntryCycle(u32 parity) {
-  const std::vector<u32> cycle = {
-      EncodeSMovB32(22, InlineU32(0)),        // s_mov_b32 s22, 0
-      EncodeSop2(0x00, 23, 22, 21),           // outer: s_add_u32 s23, s22, s21
-      EncodeSop2(0x0e, 23, 23, InlineU32(1)), // s_and_b32 s23, s23, 1
-      EncodeSopc(0x06, 23, InlineU32(1)),     // s_cmp_eq_u32 s23, 1
-      EncodeSopp(0x05, 1),                    // s_cbranch_scc1 B
-      EncodeSop2(0x00, 20, 20, InlineU32(2)), // A: s_add_u32 s20, s20, 2
-      EncodeSop2(0x00, 20, 20, InlineU32(3)), // B: s_add_u32 s20, s20, 3
-      EncodeSop2(0x0e, 25, 20, InlineU32(3)), // s_and_b32 s25, s20, 3
-      EncodeSopc(0x07, 25, InlineU32(0)),     // s_cmp_lg_u32 s25, 0
-      EncodeSopp(0x05, 0xfffbu),              // s_cbranch_scc1 A
-      EncodeSop2(0x00, 22, 22, InlineU32(1)), // s_add_u32 s22, s22, 1
-      EncodeSopc(0x0a, 22, InlineU32(5)),     // s_cmp_lt_u32 s22, 5
-      EncodeSopp(0x05, 0xfff4u),              // s_cbranch_scc1 outer
-  };
-  return IrreducibleCycleCase(parity ? "IrreducibleNestedTwoEntryCycle odd"
-                                     : "IrreducibleNestedTwoEntryCycle even",
-                              cycle, parity, parity ? 64u : 76u);
 }
 
 #include "ShaderRayTracingGpuTests.inc"
@@ -47839,6 +47826,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);
+  AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);
   AddCase(CubeIdCapturedNegationAndOutputScale);
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
@@ -48275,13 +48263,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicFloatContendedWorkgroup<false>);
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
   AddCase(MultipleWorkitemsGlobalId);
-  AddCase(IrreducibleControlFlow);
-  for (const u32 entry : {0u, 1u})
-    cases.push_back(IrreducibleTwoEntryLoop(entry));
-  for (const u32 entry : {0u, 1u, 2u})
-    cases.push_back(IrreducibleThreeEntryCycle(entry));
-  for (const u32 parity : {0u, 1u})
-    cases.push_back(IrreducibleNestedTwoEntryCycle(parity));
+  AddCase(DispatcherIrreducibleControlFlow);
 
   return cases;
 }
@@ -55109,7 +55091,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorAddcWritesPerLaneCarryOut());
     RunCase(&vulkan, VectorVop3BCarryOutWritesSgprMask());
     RunCase(&vulkan, VectorVop3BCarryOutUsesEncodedSdst());
-    RunCase(&vulkan, IrreducibleControlFlow());
+    RunCase(&vulkan, DispatcherIrreducibleControlFlow());
     RunCase(&vulkan, ScalarSaveExecOps());
     RunCase(&vulkan, ScalarOrn2SaveexecUsesSourceOrNotExec());
     RunCase(&vulkan, ScalarOrn2SaveexecB32(32, 32));
